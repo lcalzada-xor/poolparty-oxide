@@ -6,12 +6,16 @@
 
 Specifically, this project implements the **I/O Completion Port (IOCP) task queuing variant using `NtSetIoCompletion` via Worker Factories**. The injector queries kernel objects, duplicates the target process's IOCP handle, writes the payload and the undocumented `TP_DIRECT` structure into remote memory, and queues a completion packet with `KeyContext` pointing directly to that task descriptor. When dequeued, the remote worker loop (`ntdll!TppWorkerThread`) dispatches and runs our callback.
 
-The entire low-level flow runs without Win32 API wrappers. It relies on primitives from [`zada-xor`](https://github.com/lcalzada-xor/zada-xor), using dynamic SSN extraction via Hell's Gate and Halo's Gate, indirect syscalls, synthetic Call Stack Spoofing with two return gadgets, and stealth memory allocation using a `PAGE_READWRITE` $\rightarrow$ `PAGE_EXECUTE_READ` cycle (avoiding RWX memory).
+The entire low-level flow runs without Win32 API wrappers. It relies on primitives from [`zada-xor`](https://github.com/lcalzada-xor/zada-xor), using dynamic SSN extraction via Hell's Gate and Halo's Gate, indirect syscalls, synthetic Call Stack Spoofing with two return gadgets, and stealth memory allocation using a `PAGE_READWRITE` → `PAGE_EXECUTE_READ` cycle (avoiding RWX memory).
 
 > [!NOTE]
 > **Author's Note (`lcalzada-xor`):**  
 > *This is my implementation of the PoolParty technique in pure Rust. All native NT primitives, indirect syscalls, and evasion mechanics come from [`zada-xor`](https://github.com/lcalzada-xor/zada-xor), a library I'm actively developing on GitHub.*  
 > *During development, reverse-engineering undocumented structures like `TP_DIRECT` and figuring out the exact parameters for `NtSetIoCompletion` gave me plenty of headaches—especially getting the worker thread to dequeue the packet and run the code without instantly crashing the target process. I've documented all the lessons learned, offsets, and OPSEC details here so anyone interested can see how the Windows Thread Pool works under the hood.*
+
+<p align="center">
+  <img src="assets/demo.gif" alt="poolparty-oxide demonstration" width="850">
+</p>
 
 ---
 
@@ -161,7 +165,9 @@ In stark contrast, **PoolParty** targets the legitimate Windows Thread Pool infr
 
 - **No Thread Creation:** The injection operates without invoking thread creation primitives (`THREAD_CREATE = 0`). The worker threads are already running inside the target process.
 - **Natural Call Stack Anchoring:** When execution transfers to the payload callback, the call stack originates from legitimate operating system functions:
-  $$\text{ntdll!RtlUserThreadStart} \longrightarrow \text{kernel32!BaseThreadInitThunk} \longrightarrow \text{ntdll!TppWorkerThread} \longrightarrow \text{ntdll!TppDirectExecuteCallback}$$
+```math
+\text{ntdll!RtlUserThreadStart} \longrightarrow \text{kernel32!BaseThreadInitThunk} \longrightarrow \text{ntdll!TppWorkerThread} \longrightarrow \text{ntdll!TppDirectExecuteCallback}
+```
 - **Kernel Telemetry Evasion:** Because no new threads are registered, kernel notification routines (`PsSetCreateThreadNotifyRoutine`) remain completely silent. The execution packet is serviced naturally by the Windows I/O completion dispatcher.
 
 ---
@@ -193,7 +199,7 @@ sequenceDiagram
     Note over Inj,Target: Phase 3: Stealth Memory Staging
     Inj->>Target: write_process_mem_rw_rx(Payload &[u8])
     Target-->>Inj: _allocated_code_addr (RX)
-    Inj->>Inj: Synthesize TP_DIRECT { callback: _allocated_code_addr, padding: [0; 3] }
+    Inj->>Inj: Synthesize TP_DIRECT { callback: _allocated_code_addr, padding: [0, 0, 0] }
     Inj->>Target: write_process_mem_rw_rx(TP_DIRECT bytes)
     Target-->>Inj: _allocated_tpdirect_addr (RX)
 
@@ -334,14 +340,16 @@ let remote_process_handle = match open_process(
 #### Access Mask Composition & Mathematical Proof
 Rather than requesting coarse privileges such as `PROCESS_ALL_ACCESS` (`0x1FFFFF`), which generates immediate alerts in security monitoring tools (e.g., Sysmon Event ID 10: *Process Access*), `poolparty-oxide` computes a strictly bounded composite mask:
 
-$$\begin{aligned}
+```math
+\begin{aligned}
 \text{Mask} &= \text{PROCESS\_VM\_READ} \,(0x0010) \\
 &\quad \mid \text{PROCESS\_VM\_WRITE} \,(0x0020) \\
 &\quad \mid \text{PROCESS\_QUERY\_INFORMATION} \,(0x0400) \\
 &\quad \mid \text{PROCESS\_VM\_OPERATION} \,(0x0008) \\
-&\quad \mid \text{PROCESS\_DUP_HANDLE} \,(0x0040) \\
+&\quad \mid \text{PROCESS\_DUP\_HANDLE} \,(0x0040) \\
 &= 0x0010 \mid 0x0020 \mid 0x0400 \mid 0x0008 \mid 0x0040 = \mathbf{0x0478}
-\end{aligned}$$
+\end{aligned}
+```
 
 | Access Flag | Numerical Value | Functional Requirement in Pipeline |
 |:---|:---:|:---|
@@ -440,7 +448,7 @@ let next_addr = (current_entry_ptr as usize)
 current_entry_ptr = align_up(next_addr, size_of::<usize>()) as *const OBJECT_TYPE_INFORMATION;
 ```
 
-When `entry.TypeName` decodes to `"IoCompletion"` (case-insensitive UTF-16 comparison), the function extracts `entry.TypeIndex` (or falls back to the enumeration index $i$ on older Windows versions), returning `iocp_idx`.
+When `entry.TypeName` decodes to `"IoCompletion"` (case-insensitive UTF-16 comparison), the function extracts `entry.TypeIndex` (or falls back to the enumeration index *i* on older Windows versions), returning `iocp_idx`.
 
 ---
 
@@ -481,7 +489,9 @@ pub struct PROCESS_HANDLE_SNAPSHOT_INFORMATION {
 #### Slack Margin for Handle Churn
 Because active processes open and close handles continuously, handle snapshotting is susceptible to race conditions. If the kernel returns `STATUS_INFO_LENGTH_MISMATCH` (`0xC0000004`), `query_information_process` recalculates the required size and adds a safety margin of 16 handle entries:
 
-$$\text{BufferSize} = \text{RequiredLength} + (\text{sizeof}(\text{PROCESS\_HANDLE\_TABLE\_ENTRY\_INFO}) \times 16)$$
+```math
+\text{BufferSize} = \text{RequiredLength} + (\text{sizeof}(\text{PROCESS\_HANDLE\_TABLE\_ENTRY\_INFO}) \times 16)
+```
 
 This slack margin prevents iterative failure loops caused by target processes opening new descriptors mid-query. The engine iterates over `handle_info.Handles[0..NumberOfHandles]` and returns the first entry where `entry.ObjectTypeIndex == iocp_idx as u32`.
 
@@ -771,12 +781,14 @@ The integration testbed located at `examples/example.rs` demonstrates the end-to
 #### Mathematical Specification of `unique_hash`
 The hashing algorithm implemented in `zada-xor/src/techniques/evasion/api_hashing.rs` modifies standard 32-bit FNV-1a with a 7-bit right bitwise rotation (ROR-7) and a final XOR transformation:
 
-$$\begin{aligned}
+```math
+\begin{aligned}
 h_0 &= \mathbf{0x811C9DC5} \quad (\text{32-bit FNV Offset Basis}) \\
 h_{i}' &= (h_{i-1} \oplus \text{byte}_i) \times \mathbf{16777619} \quad (\text{FNV Prime: } 0x01000193) \\
 h_i &= (h_{i}' \gg 7) \mid (h_{i}' \ll 25) \quad (\text{ROR-7 Operation}) \\
 \text{Final Hash} &= h_n \oplus \mathbf{0x7F3A9C12} \quad (\text{XOR Mask})
-\end{aligned}$$
+\end{aligned}
+```
 
 ```rust
 pub fn unique_hash(name: &str) -> u32 {
@@ -832,7 +844,7 @@ println!("Por favor, selecciona un pid para continuar:");
 Implemented in `zada-xor/src/techniques/discovery/process.rs`, the routine queries `NtQuerySystemInformation` (hash `0xc3d78064`) using `SystemProcessInformation = 5`:
 
 1. **Initial Size Probe:** Queries with a null pointer and length 0 to obtain the required length via `STATUS_INFO_LENGTH_MISMATCH` (`0xC0000004`).
-2. **Buffer Allocation with Slack Headroom:** Allocates `return_length + 0x2000` bytes. The additional $8\,\text{KB}$ (`0x2000`) slack buffer prevents buffer allocation failures if new processes spawn between the probe and the query.
+2. **Buffer Allocation with Slack Headroom:** Allocates `return_length + 0x2000` bytes. The additional 8 KB (`0x2000`) slack buffer prevents buffer allocation failures if new processes spawn between the probe and the query.
 3. **Contiguous Record Traversal:** Traverses the linked records using `next_entry_offset`. Traversal terminates when `next_entry_offset == 0`.
 4. **Unicode Table Formatting:** Generates a structured Unicode box-drawing table displaying `PID`, `PPID`, `Session`, `Threads`, `Handles`, `Working Set` (auto-formatted in B, KB, MB, GB), and `Process Name`.
 
@@ -950,7 +962,7 @@ wine target/x86_64-pc-windows-gnu/release/examples/example.exe
 
 | Tactic | Technique | Sub-technique / ID | Description |
 |:---|:---|:---:|:---|
-| **Defense Evasion / Privilege Escalation** | Process Injection | [T1055.016](https://attack.mitre.org/techniques/T1055/016/) | Thread Pool-Based Process Injection (PoolParty via `NtSetIoCompletion` & `TP_DIRECT`) |
+| **Defense Evasion / Privilege Escalation** | Process Injection | [T1055](https://attack.mitre.org/techniques/T1055/) | Thread Pool-Based Process Injection (PoolParty via `NtSetIoCompletion` & `TP_DIRECT`) |
 
 ---
 
@@ -967,19 +979,19 @@ This repository is part of a series of technical explorations into Windows NT in
 ## Resources, External References & Useful Links
 
 ### 1. Original PoolParty Research (SafeBreach Labs)
-- **Original Research Article:** [SafeBreach Blog: Process Injection: The Windows Thread Pool (PoolParty)](https://www.safebreach.com/blog/process-injection-using-windows-thread-pool/) by Alon Leviev.
+- **Original Research Article:** [SafeBreach Blog: Process Injection Using Windows Thread Pools](https://www.safebreach.com/blog/process-injection-using-windows-thread-pools/) by Alon Leviev.
 - **Official Tool Repository:** [SafeBreach-Labs/PoolParty on GitHub](https://github.com/SafeBreach-Labs/PoolParty) — Original C/C++ PoC covering all 8 injection variants.
-- **Black Hat Europe 2023 Briefing:** [The Pool Party You Will Never Forget: New Process Injection Techniques Using Windows Thread Pools](https://www.blackhat.com/eu-23/briefings/schedule/#the-pool-party-you-will-never-forget-new-process-injection-techniques-using-windows-thread-pools-35442).
-- **SafeBreach Technical Whitepaper (PDF):** [PoolParty - Process Injection Using Windows Thread Pool](https://raw.githubusercontent.com/SafeBreach-Labs/PoolParty/main/PoolParty%20-%20Process%20Injection%20Using%20Windows%20Thread%20Pool.pdf).
+- **Black Hat Europe 2023 Briefing:** [The Pool Party You Will Never Forget: New Process Injection Techniques Using Windows Thread Pools](https://www.blackhat.com/eu-23/briefings/schedule/#the-pool-party-you-will-never-forget-new-process-injection-techniques-using-windows-thread-pools-35446).
+- **Black Hat Europe 2023 Presentation (PDF):** [The Pool Party You Will Never Forget Slides](https://i.blackhat.com/EU-23/Presentations/EU-23-Leviev-The-Pool-Party-You-Will-Never-Forget.pdf).
 
 ### 2. Windows Thread Pool & NT Internals Documentation
 - **Microsoft Learn (Official Documentation):**
-  - [About the Thread Pool](https://learn.microsoft.com/en-us/windows/win32/procthread/about-the-thread-pool) — Architecture and core components of the Win32 thread pool.
+  - [Thread Pools](https://learn.microsoft.com/en-us/windows/win32/procthread/thread-pools) — Architecture and core components of the Win32 thread pool.
   - [Using the Thread Pool Functions](https://learn.microsoft.com/en-us/windows/win32/procthread/using-the-thread-pool-functions) — Standard usage examples for worker factories, work items, and timers.
   - [I/O Completion Ports (IOCP)](https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports) — Official specification for asynchronous I/O completion ports.
 - **Reverse Engineering & Undocumented NT Internals:**
   - [Geoff Chappell: NTDLL Thread Pool Functions](https://www.geoffchappell.com/studies/windows/win32/ntdll/history/) — Detailed reverse-engineered history of `ntdll.dll` internal `Tpp*` functions.
-  - [System Informer (Process Hacker) - nttpp.h](https://github.com/winsiderss/systeminformer/blob/master/phnt/include/nttpp.h) — C header definitions for undocumented thread pool structures (`TP_DIRECT`, `TP_TASK`, `TP_POOL`).
+  - [System Informer (Process Hacker) - nttp.h](https://github.com/winsiderss/systeminformer/blob/master/phnt/include/nttp.h) — C header definitions for undocumented thread pool structures (`TP_DIRECT`, `TP_TASK`, `TP_POOL`).
   - [Undocumented NT Functions: NtSetIoCompletion](https://undocumented.ntinternals.net/index.html?page=UserMode%2FUndocumented%20Functions%2FNT%20Objects%2FFile%2FNtSetIoCompletion.html) — Kernel prototype and parameter specification for `NtSetIoCompletion`.
   - *Windows Internals (7th Edition, Part 1 & 2)* — Pavel Yosifovich, Mark Russinovich, David Solomon, and Alex Ionescu.
 

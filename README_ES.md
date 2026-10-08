@@ -53,7 +53,7 @@ Todo el flujo de bajo nivel funciona sin recurrir a la API estándar de Win32. S
   - [7. Despacho de la Tarea: NtSetIoCompletion y la Mecánica de KeyContext](#7-despacho-de-la-tarea-ntsetiocompletion-y-la-mecánica-de-keycontext)
   - [8. Limpieza y Ciclo de Vida de Handles: NtClose](#8-limpieza-y-ciclo-de-vida-de-handles-ntclose)
 - [El Banco de Pruebas de Integración (examples/example.rs)](#el-banco-de-pruebas-de-integración-examplesexamplers)
-  - [Etapa 1: Adquisición del PID Local y el Algoritmo unique_hash](#etapa-1-adquisición-del-pid-local-y-el-algoritmo-unique_hash)
+  - [Etapa 1: Adquisición del Objetivo y el Algoritmo unique_hash](#etapa-1-adquisición-del-objetivo-y-el-algoritmo-unique_hash)
   - [Etapa 2: Descubrimiento de Procesos del Sistema vía NtQuerySystemInformation](#etapa-2-descubrimiento-de-procesos-del-sistema-vía-ntquerysysteminformation)
   - [Etapa 3: Apertura del Proceso y Ejecución de PoolParty](#etapa-3-apertura-del-proceso-y-ejecución-de-poolparty)
 - [Guía de Compilación Cruzada y Ejecución](#guía-de-compilación-cruzada-y-ejecución)
@@ -141,24 +141,11 @@ Durante décadas, las técnicas de inyección de procesos en espacio de usuario 
 3. **Secuestro de Contexto de Hilos (`NtSuspendThread`, `NtSetContextThread`, `NtResumeThread`):**
    - **Disrupción del Hilo:** Suspenden un hilo en ejecución y sobrescriben por la fuerza su puntero de instrucciones (`RIP`/`EIP`), provocando inestabilidad severa en el proceso anfitrión y generando eventos ETW-Ti de tipo `THREAD_SET_CONTEXT`.
 
-```
-Inyección Tradicional (Alta Telemetría)
-+-------------------+           +---------------------+           +------------------------+
-| Proceso Inyector  | --------> | NtCreateThreadEx    | --------> | PsSetCreateThreadNotify|
-|                   |           | (Nuevo Hilo Remoto) |           | [ETW-Ti THREAD_CREATE] |
-+-------------------+           +---------------------+           +------------------------+
-                                                                             |
-                                                                             v
-                                                                  [ALARMA: Entrada No Respaldada]
-
-Inyección PoolParty por IOCP (Cero Telemetría de Creación de Hilos)
-+-------------------+           +---------------------+           +------------------------+
-| Proceso Inyector  | --------> | NtSetIoCompletion   | --------> | ntdll!TppWorkerThread  |
-| (IOCP Duplicado)  |           | (Encola Paquete)    |           | [Bucle Worker Legítimo]|
-+-------------------+           +---------------------+           +------------------------+
-                                                                             |
-                                                                             v
-                                                                  [LIMPIO: Entrada Legítima]
+```math
+\begin{aligned}
+\textbf{Tradicional:}\quad &\text{Proceso Inyector} \xrightarrow{\text{NtCreateThreadEx}} \text{Nuevo Hilo Remoto} \xrightarrow{\text{Callback de Kernel}} \mathbf{\text{PsSetCreateThreadNotify}} \implies [\mathbf{ALARMA:}\text{ Inicio en Memoria no Respaldada}] \\[6pt]
+\textbf{PoolParty:}\quad &\text{Inyector (IOCP Duplicado)} \xrightarrow{\text{NtSetIoCompletion}} \text{Cola de Tareas (IOCP)} \xrightarrow{\text{Bucle Nativo}} \mathbf{\text{ntdll!TppWorkerThread}} \implies [\mathbf{LIMPIO:}\text{ Inicio de Worker Legítimo}]
+\end{aligned}
 ```
 
 En marcado contraste, **PoolParty** abusa de la infraestructura legítima del Thread Pool de Windows presente en prácticamente todos los procesos de usuario del sistema operativo:
@@ -217,50 +204,18 @@ sequenceDiagram
     Note over Target: El Payload ejecutable se ejecuta dentro del Worker Thread legítimo
 ```
 
-```
-====================================================================================================
-                        FLUJO SECUENCIAL DETALLADO EN ASCII
-====================================================================================================
-
-[ PROCESO INYECTOR ]                                         [ PROCESO OBJETIVO ]
-(poolparty-oxide)                                            (Thread Pool Anfitrión)
-       |                                                             |
- 1. NtOpenProcess(PID, 0x0478) ------------------------------------> | [Handle de Proceso Adquirido]
-       |                                                             |
- 2. NtQueryObject(ObjectTypesInformation)                            |
-    --> Bucle de sondeo resuelve TypeIndex de "IoCompletion"         |
-       |                                                             |
- 3. NtQueryInformationProcess(ProcessHandleInformation) ------------>| [Instantánea de Tabla de Handles]
-    --> Itera descriptores; localiza entrada con TypeIndex coin.     |
-       |                                                             |
- 4. NtDuplicateObject(remote_handle, remote_iocp, CurrentProcess) <--| [Handle IOCP Clonado]
-    --> Produce duplicated_handle localmente                         |
-       |                                                             |
- 5. write_process_mem_rw_rx(remote_handle, payload: &[u8]) --------->| Reserva RW -> Escribe -> Transición RX
-    --> Devuelve _allocated_code_addr                                | (Dirección Virtual: Base del Código)
-       |                                                             |
- 6. Sintetiza TP_DIRECT { callback: _allocated_code_addr }          |
-    write_process_mem_rw_rx(remote_handle, tp_direct.as_bytes()) --->| Reserva RW -> Escribe -> Transición RX
-    --> Devuelve _allocated_tpdirect_addr                             | (Dirección Virtual: Base Estructura)
-       |                                                             |
- 7. NtSetIoCompletion(                                               |
-        IoCompletionHandle = duplicated_handle,                      |
-        KeyContext         = _allocated_tpdirect_addr,               |
-        ApcContext         = NULL,                                   |
-        IoStatus           = 0,                                      |
-        IoStatusInfo       = NULL                                    |
-    ) -------------------------------------------------------------> | [Cola IOCP del Kernel]
-       |                                                             |        |
- 8. NtClose(duplicated_handle)                                       |        v
-    NtClose(remote_process_handle)                                   | [Worker Thread se Activa]
-       |                                                             | NtRemoveIoCompletion extrae paquete
-                                                                     | KeyContext moldeado a PTP_DIRECT
-                                                                     | TppDirectExecuteCallback()
-                                                                     |        |
-                                                                     |        v
-                                                                     | Invoca TP_DIRECT.callback
-                                                                     | Ejecuta Carga Útil (&[u8])
-====================================================================================================
+```math
+\begin{aligned}
+\text{Etapa 1: } &\text{Adquisición del Objetivo} &&\mathcal{P}_{\text{target}} \gets \text{NtOpenProcess}(\text{PID}, \mathbf{0x0478}) \\
+\text{Etapa 2: } &\text{Resolución de Tipo} &&\mathcal{T}_{\text{IOCP}} \gets \text{NtQueryObject}(\text{ObjectTypesInformation}) \\
+\text{Etapa 3: } &\text{Descubrimiento de Handle} &&\mathcal{H}_{\text{remote}} \gets \text{NtQueryInformationProcess}(\mathcal{P}_{\text{target}}, \text{Clase 51}) \\
+\text{Etapa 4: } &\text{Duplicación de Handle} &&\mathcal{H}_{\text{local}} \gets \text{NtDuplicateObject}(\mathcal{P}_{\text{target}}, \mathcal{H}_{\text{remote}}, \text{CurrentProcess}) \\
+\text{Etapa 5: } &\text{Alojamiento de Payload} &&\alpha_{\text{code}} \gets \text{write\_process\_mem\_rw\_rx}(\mathcal{P}_{\text{target}}, \text{payload}) \\
+\text{Etapa 6: } &\text{Alojamiento de TP\_DIRECT} &&\alpha_{\text{task}} \gets \text{write\_process\_mem\_rw\_rx}(\mathcal{P}_{\text{target}}, \text{TP\_DIRECT}\{\text{callback}: \alpha_{\text{code}}\}) \\
+\text{Etapa 7: } &\text{Encolado del Paquete} &&\text{NtSetIoCompletion}(\mathcal{H}_{\text{local}}, \text{KeyContext} = \alpha_{\text{task}}) \\
+\text{Etapa 8: } &\text{Cierre de Recursos} &&\text{NtClose}(\mathcal{H}_{\text{local}}) \land \text{NtClose}(\mathcal{P}_{\text{target}}) \\
+\text{Etapa 9: } &\text{Ejecución en el Worker} &&\text{ntdll!TppWorkerThread} \xrightarrow{\text{despacho}} \text{TppDirectExecuteCallback}(\alpha_{\text{task}}) \to \text{Payload}
+\end{aligned}
 ```
 
 ---
@@ -540,18 +495,14 @@ Asignar memoria directamente con protección `PAGE_EXECUTE_READWRITE` (RWX / `0x
 
 Para eliminar firmas estáticas RWX, `write_process_mem_rw_rx` implementa un ciclo de vida en tres etapas:
 
-```
-Paso 1: NtAllocateVirtualMemory (PAGE_READWRITE: 0x04)
-        [ Reserva memoria limpia no ejecutable con permisos de lectura/escritura ]
-                          |
-                          v
-Paso 2: NtWriteVirtualMemory
-        [ Escribe la rebanada de bytes (&[u8]) en el búfer RW ]
-        [ Valida: bytes_escritos == buffer.len() ]
-                          |
-                          v
-Paso 3: NtProtectVirtualMemory (PAGE_EXECUTE_READ: 0x20)
-        [ Elimina permisos de escritura y otorga capacidad de ejecución ]
+```math
+\begin{aligned}
+\mathbf{Paso\,1:}\quad &\text{NtAllocateVirtualMemory} &&\xrightarrow{\text{Reserva}} \mathbf{PAGE\_READWRITE} \,(0x04) \quad &&\text{[Memoria no ejecutable]} \\
+&\quad\Big\downarrow \\
+\mathbf{Paso\,2:}\quad &\text{NtWriteVirtualMemory} &&\xrightarrow{\text{Escribe Payload}} \text{Búfer}[\&[u8]] \quad &&\text{[Verificado: } bytes = len\text{]} \\
+&\quad\Big\downarrow \\
+\mathbf{Paso\,3:}\quad &\text{NtProtectVirtualMemory} &&\xrightarrow{\text{Modifica Protección}} \mathbf{PAGE\_EXECUTE\_READ} \,(0x20) \quad &&\text{[Ejecución sin RWX]}
+\end{aligned}
 ```
 
 ```rust
@@ -617,34 +568,31 @@ pub struct TP_DIRECT {
 }
 ```
 
-#### Mapa de Memoria ASCII Exhaustivo de 72 Bytes (Offsets 0x00 a 0x47)
+#### Mapa de Memoria y Formulación Estructural de 72 Bytes (Offsets 0x00 a 0x47)
 
-```text
-====================================================================================================
-               DISTRIBUCIÓN DE MEMORIA EN 64 BITS DE TP_DIRECT (72 BYTES / 0x48)
-====================================================================================================
-Desplazamiento Tamaño  Nombre del Campo                        Tipo            Descripción
-----------------------------------------------------------------------------------------------------
-0x00..0x07     8 B     task.callbacks                         *mut CALLBACKS  Puntero a tabla de despacho (NULL)
-0x08..0x0B     4 B     task.numa_node                         ULONG (u32)     Afinidad a nodo NUMA (0 = defecto)
-0x0C           1 B     task.ideal_processor                   UINT8 (u8)      Núcleo preferido (0 = cualquiera)
-0x0D..0x0F     3 B     task._padding                          [u8; 3]         Relleno explícito de estructura
-0x10..0x17     8 B     task.list_entry.Flink                  *mut LIST_ENTRY Flink de lista doble de tareas
-0x18..0x1F     8 B     task.list_entry.Blink                  *mut LIST_ENTRY Blink de lista doble de tareas
-----------------------------------------------------------------------------------------------------
-[0x00..0x1F: Estructura Incrustada TP_TASK = 32 Bytes / 0x20]
-----------------------------------------------------------------------------------------------------
-0x20..0x27     8 B     lock                                   ULONGLONG (u64) Spinlock / contador de estado (0)
-0x28..0x2F     8 B     io_completion_info_list.Flink          *mut LIST_ENTRY Flink de info de IOCP
-0x30..0x37     8 B     io_completion_info_list.Blink          *mut LIST_ENTRY Blink de info de IOCP
-0x38..0x3F     8 B     callback                               PVOID           PUNTERO DE EJECUCIÓN (Base Payload)
-0x40..0x43     4 B     numa_node                              ULONG (u32)     Preferencia de nodo NUMA (0)
-0x44           1 B     ideal_processor                        UCHAR (u8)      Afinidad de núcleo (0 = cualquiera)
-0x45..0x47     3 B     _padding                               [u8; 3]         Relleno explícito de alineación
-====================================================================================================
-Tamaño Total: 72 Bytes (0x48) | Alineación: 8 Bytes | Offset de Callback: +0x38 (56 en decimal)
-====================================================================================================
+```math
+\begin{aligned}
+\text{sizeof}(\text{TP\_DIRECT}) &= \underbrace{\text{sizeof}(\text{TP\_TASK})}_{\mathbf{32\text{ bytes (0x20)}}} + \underbrace{\text{Lock + ListEntry}}_{\mathbf{24\text{ bytes (0x18)}}} + \underbrace{\mathbf{Callback}}_{\mathbf{8\text{ bytes (0x08)}}} + \underbrace{\text{Afinidad y Relleno}}_{\mathbf{8\text{ bytes (0x08)}}} \\
+&= 32 + 24 + 8 + 8 = \mathbf{72\text{ bytes (0x48)}} \implies \text{Offset}(\text{callback}) = \mathbf{+0x38}
+\end{aligned}
 ```
+
+| Desplazamiento | Tamaño | Nombre del Campo | Tipo | Descripción |
+|:---|:---:|:---|:---|:---|
+| `0x00..0x07` | 8 B | `task.callbacks` | `*mut CALLBACKS` | Puntero a tabla de despacho (NULL) |
+| `0x08..0x0B` | 4 B | `task.numa_node` | `ULONG` (`u32`) | Afinidad a nodo NUMA (`0` = defecto) |
+| `0x0C` | 1 B | `task.ideal_processor` | `UINT8` (`u8`) | Núcleo preferido (`0` = cualquiera) |
+| `0x0D..0x0F` | 3 B | `task._padding` | `[u8; 3]` | Relleno explícito de estructura |
+| `0x10..0x17` | 8 B | `task.list_entry.Flink` | `*mut LIST_ENTRY` | Flink de lista doble de tareas |
+| `0x18..0x1F` | 8 B | `task.list_entry.Blink` | `*mut LIST_ENTRY` | Blink de lista doble de tareas |
+| **`0x00..0x1F`** | **32 B** | **Estructura `TP_TASK`** | `TP_TASK` | **Cabecera de Tarea Incrustada (`0x20` bytes)** |
+| `0x20..0x27` | 8 B | `lock` | `ULONGLONG` (`u64`) | Spinlock / contador de estado (`0`) |
+| `0x28..0x2F` | 8 B | `io_completion_info_list.Flink` | `*mut LIST_ENTRY` | Flink de info de IOCP |
+| `0x30..0x37` | 8 B | `io_completion_info_list.Blink` | `*mut LIST_ENTRY` | Blink de info de IOCP |
+| **`0x38..0x3F`** | **8 B** | **`callback`** | **`PVOID`** | **PUNTERO DE EJECUCIÓN (Base Payload)** |
+| `0x40..0x43` | 4 B | `numa_node` | `ULONG` (`u32`) | Preferencia de nodo NUMA (`0`) |
+| `0x44` | 1 B | `ideal_processor` | `UCHAR` (`u8`) | Afinidad de núcleo (`0` = cualquiera) |
+| `0x45..0x47` | 3 B | `_padding` | `[u8; 3]` | Relleno explícito de alineación |
 
 #### Comparativa entre Arquitecturas (x86 vs x86_64)
 

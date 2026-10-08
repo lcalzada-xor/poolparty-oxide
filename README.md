@@ -141,24 +141,11 @@ For decades, user-mode process injection techniques relied on a narrow set of we
 3. **Thread Context Hijacking (`NtSuspendThread`, `NtSetContextThread`, `NtResumeThread`):**
    - **Thread Disruption:** Suspends a running thread and forcibly overwrites its instruction pointer (`RIP`/`EIP`), creating severe instability and triggering ETW-Ti `THREAD_SET_CONTEXT` telemetry.
 
-```
-Traditional Injection (High Telemetry)
-+-------------------+           +---------------------+           +------------------------+
-| Injector Process  | --------> | NtCreateThreadEx    | --------> | PsSetCreateThreadNotify|
-|                   |           | (New Remote Thread) |           | [ETW-Ti THREAD_CREATE] |
-+-------------------+           +---------------------+           +------------------------+
-                                                                             |
-                                                                             v
-                                                                  [ALARM: Unbacked Start]
-
-PoolParty IOCP Injection (Zero Thread Creation Telemetry)
-+-------------------+           +---------------------+           +------------------------+
-| Injector Process  | --------> | NtSetIoCompletion   | --------> | ntdll!TppWorkerThread  |
-| (Duplicated IOCP) |           | (Queues Task Packet)|           | [Existing Worker Loop] |
-+-------------------+           +---------------------+           +------------------------+
-                                                                             |
-                                                                             v
-                                                                  [CLEAN: Valid Thread Start]
+```math
+\begin{aligned}
+\textbf{Traditional:}\quad &\text{Injector Process} \xrightarrow{\text{NtCreateThreadEx}} \text{New Remote Thread} \xrightarrow{\text{Kernel Callback}} \mathbf{\text{PsSetCreateThreadNotify}} \implies [\mathbf{ALARM:}\text{ Unbacked Thread Start}] \\[6pt]
+\textbf{PoolParty:}\quad &\text{Injector (Duplicated IOCP)} \xrightarrow{\text{NtSetIoCompletion}} \text{Task Queue (IOCP)} \xrightarrow{\text{Native Loop}} \mathbf{\text{ntdll!TppWorkerThread}} \implies [\mathbf{CLEAN:}\text{ Legitimate Worker Start}]
+\end{aligned}
 ```
 
 In stark contrast, **PoolParty** targets the legitimate Windows Thread Pool infrastructure present in virtually every user-mode process:
@@ -217,50 +204,18 @@ sequenceDiagram
     Note over Target: Executable Payload executes inside legitimate Worker Thread
 ```
 
-```
-====================================================================================================
-                             ASCII DETAILED SEQUENCE FLOW
-====================================================================================================
-
-[ INJECTOR PROCESS ]                                         [ TARGET PROCESS ]
-(poolparty-oxide)                                            (Host Thread Pool)
-       |                                                             |
- 1. NtOpenProcess(PID, 0x0478) ------------------------------------> | [Process Handle Acquired]
-       |                                                             |
- 2. NtQueryObject(ObjectTypesInformation)                            |
-    --> Probing loop resolves TypeIndex for "IoCompletion"           |
-       |                                                             |
- 3. NtQueryInformationProcess(ProcessHandleInformation) ------------>| [Handle Table Snapshot]
-    --> Iterates handles; finds entry with matching TypeIndex        |
-       |                                                             |
- 4. NtDuplicateObject(remote_handle, remote_iocp, CurrentProcess) <--| [IOCP Handle Cloned]
-    --> Produces local duplicated_handle                             |
-       |                                                             |
- 5. write_process_mem_rw_rx(remote_handle, payload: &[u8]) --------->| Allocates RW -> Writes -> Flips RX
-    --> Returns _allocated_code_addr                                 | (Virtual Address: Code Base)
-       |                                                             |
- 6. Synthesizes TP_DIRECT { callback: _allocated_code_addr }         |
-    write_process_mem_rw_rx(remote_handle, tp_direct.as_bytes()) --->| Allocates RW -> Writes -> Flips RX
-    --> Returns _allocated_tpdirect_addr                             | (Virtual Address: Struct Base)
-       |                                                             |
- 7. NtSetIoCompletion(                                               |
-        IoCompletionHandle = duplicated_handle,                      |
-        KeyContext         = _allocated_tpdirect_addr,               |
-        ApcContext         = NULL,                                   |
-        IoStatus           = 0,                                      |
-        IoStatusInfo       = NULL                                    |
-    ) -------------------------------------------------------------> | [Kernel IOCP Queue]
-       |                                                             |        |
- 8. NtClose(duplicated_handle)                                       |        v
-    NtClose(remote_process_handle)                                   | [Worker Thread Wakes Up]
-       |                                                             | NtRemoveIoCompletion pops packet
-                                                                     | KeyContext cast to PTP_DIRECT
-                                                                     | TppDirectExecuteCallback()
-                                                                     |        |
-                                                                     |        v
-                                                                     | Invocates TP_DIRECT.callback
-                                                                     | Executes Payload (&[u8])
-====================================================================================================
+```math
+\begin{aligned}
+\text{Stage 1: } &\text{Target Acquisition} &&\mathcal{P}_{\text{target}} \gets \text{NtOpenProcess}(\text{PID}, \mathbf{0x0478}) \\
+\text{Stage 2: } &\text{Type Discovery} &&\mathcal{T}_{\text{IOCP}} \gets \text{NtQueryObject}(\text{ObjectTypesInformation}) \\
+\text{Stage 3: } &\text{Handle Discovery} &&\mathcal{H}_{\text{remote}} \gets \text{NtQueryInformationProcess}(\mathcal{P}_{\text{target}}, \text{Class 51}) \\
+\text{Stage 4: } &\text{Handle Duplication} &&\mathcal{H}_{\text{local}} \gets \text{NtDuplicateObject}(\mathcal{P}_{\text{target}}, \mathcal{H}_{\text{remote}}, \text{CurrentProcess}) \\
+\text{Stage 5: } &\text{Payload Staging} &&\alpha_{\text{code}} \gets \text{write\_process\_mem\_rw\_rx}(\mathcal{P}_{\text{target}}, \text{payload}) \\
+\text{Stage 6: } &\text{TP\_DIRECT Staging} &&\alpha_{\text{task}} \gets \text{write\_process\_mem\_rw\_rx}(\mathcal{P}_{\text{target}}, \text{TP\_DIRECT}\{\text{callback}: \alpha_{\text{code}}\}) \\
+\text{Stage 7: } &\text{Packet Queuing} &&\text{NtSetIoCompletion}(\mathcal{H}_{\text{local}}, \text{KeyContext} = \alpha_{\text{task}}) \\
+\text{Stage 8: } &\text{Resource Teardown} &&\text{NtClose}(\mathcal{H}_{\text{local}}) \land \text{NtClose}(\mathcal{P}_{\text{target}}) \\
+\text{Stage 9: } &\text{Worker Execution} &&\text{ntdll!TppWorkerThread} \xrightarrow{\text{dequeue}} \text{TppDirectExecuteCallback}(\alpha_{\text{task}}) \to \text{Payload}
+\end{aligned}
 ```
 
 ---
@@ -540,18 +495,14 @@ Directly allocating memory with `PAGE_EXECUTE_READWRITE` (RWX / `0x40`) creates 
 
 To avoid RWX signatures, `write_process_mem_rw_rx` implements a three-phase memory staging lifecycle:
 
-```
-Step 1: NtAllocateVirtualMemory (PAGE_READWRITE: 0x04)
-        [ Allocates clean non-executable read/write memory ]
-                          |
-                          v
-Step 2: NtWriteVirtualMemory
-        [ Writes payload bytes (&[u8]) into RW buffer ]
-        [ Verifies: bytes_written == payload.len() ]
-                          |
-                          v
-Step 3: NtProtectVirtualMemory (PAGE_EXECUTE_READ: 0x20)
-        [ Strips write access, grants execution capability ]
+```math
+\begin{aligned}
+\mathbf{Step\,1:}\quad &\text{NtAllocateVirtualMemory} &&\xrightarrow{\text{Allocates}} \mathbf{PAGE\_READWRITE} \,(0x04) \quad &&\text{[Non-executable memory]} \\
+&\quad\Big\downarrow \\
+\mathbf{Step\,2:}\quad &\text{NtWriteVirtualMemory} &&\xrightarrow{\text{Stages Payload}} \text{Buffer}[\&[u8]] \quad &&\text{[Verified: } bytes = len\text{]} \\
+&\quad\Big\downarrow \\
+\mathbf{Step\,3:}\quad &\text{NtProtectVirtualMemory} &&\xrightarrow{\text{Flips Protection}} \mathbf{PAGE\_EXECUTE\_READ} \,(0x20) \quad &&\text{[Execution without RWX]}
+\end{aligned}
 ```
 
 ```rust
@@ -617,34 +568,31 @@ pub struct TP_DIRECT {
 }
 ```
 
-#### Comprehensive 72-Byte ASCII Memory Map (Offsets 0x00 to 0x47)
+#### Comprehensive 72-Byte Memory Map & Structural Formulation (Offsets 0x00 to 0x47)
 
-```text
-====================================================================================================
-                        TP_DIRECT 64-BIT MEMORY LAYOUT (72 BYTES / 0x48)
-====================================================================================================
-Offset      Size    Field Name                             Type            Description
-----------------------------------------------------------------------------------------------------
-0x00..0x07  8 B     task.callbacks                         *mut CALLBACKS  Pointer to dispatch table (NULL)
-0x08..0x0B  4 B     task.numa_node                         ULONG (u32)     NUMA node affinity (0 = default)
-0x0C        1 B     task.ideal_processor                   UINT8 (u8)      Preferred CPU core (0 = any)
-0x0D..0x0F  3 B     task._padding                          [u8; 3]         Explicit struct padding
-0x10..0x17  8 B     task.list_entry.Flink                  *mut LIST_ENTRY Doubly-linked task list Flink
-0x18..0x1F  8 B     task.list_entry.Blink                  *mut LIST_ENTRY Doubly-linked task list Blink
-----------------------------------------------------------------------------------------------------
-[0x00..0x1F: Total TP_TASK Embedded Structure = 32 Bytes / 0x20]
-----------------------------------------------------------------------------------------------------
-0x20..0x27  8 B     lock                                   ULONGLONG (u64) Spinlock / state counter (0)
-0x28..0x2F  8 B     io_completion_info_list.Flink          *mut LIST_ENTRY IOCP info list forward pointer
-0x30..0x37  8 B     io_completion_info_list.Blink          *mut LIST_ENTRY IOCP info list backward pointer
-0x38..0x3F  8 B     callback                               PVOID           EXECUTION TARGET POINTER (Payload Base)
-0x40..0x43  4 B     numa_node                              ULONG (u32)     NUMA node preference (0 = default)
-0x44        1 B     ideal_processor                        UCHAR (u8)      Core affinity (0 = any)
-0x45..0x47  3 B     _padding                               [u8; 3]         Explicit alignment padding
-====================================================================================================
-Total Struct Size: 72 Bytes (0x48) | Struct Alignment: 8 Bytes | Callback Target Offset: +0x38 (56 dec)
-====================================================================================================
+```math
+\begin{aligned}
+\text{sizeof}(\text{TP\_DIRECT}) &= \underbrace{\text{sizeof}(\text{TP\_TASK})}_{\mathbf{32\text{ bytes (0x20)}}} + \underbrace{\text{Lock + ListEntry}}_{\mathbf{24\text{ bytes (0x18)}}} + \underbrace{\mathbf{Callback}}_{\mathbf{8\text{ bytes (0x08)}}} + \underbrace{\text{Affinity \& Padding}}_{\mathbf{8\text{ bytes (0x08)}}} \\
+&= 32 + 24 + 8 + 8 = \mathbf{72\text{ bytes (0x48)}} \implies \text{Offset}(\text{callback}) = \mathbf{+0x38}
+\end{aligned}
 ```
+
+| Offset | Size | Field Name | Type | Description |
+|:---|:---:|:---|:---|:---|
+| `0x00..0x07` | 8 B | `task.callbacks` | `*mut CALLBACKS` | Pointer to dispatch table (NULL) |
+| `0x08..0x0B` | 4 B | `task.numa_node` | `ULONG` (`u32`) | NUMA node affinity (`0` = default) |
+| `0x0C` | 1 B | `task.ideal_processor` | `UINT8` (`u8`) | Preferred CPU core (`0` = any) |
+| `0x0D..0x0F` | 3 B | `task._padding` | `[u8; 3]` | Explicit struct padding |
+| `0x10..0x17` | 8 B | `task.list_entry.Flink` | `*mut LIST_ENTRY` | Doubly-linked task list Flink |
+| `0x18..0x1F` | 8 B | `task.list_entry.Blink` | `*mut LIST_ENTRY` | Doubly-linked task list Blink |
+| **`0x00..0x1F`** | **32 B** | **`TP_TASK` Sub-struct** | `TP_TASK` | **Embedded Task Header (`0x20` bytes)** |
+| `0x20..0x27` | 8 B | `lock` | `ULONGLONG` (`u64`) | Spinlock / state counter (`0`) |
+| `0x28..0x2F` | 8 B | `io_completion_info_list.Flink` | `*mut LIST_ENTRY` | IOCP info list forward pointer |
+| `0x30..0x37` | 8 B | `io_completion_info_list.Blink` | `*mut LIST_ENTRY` | IOCP info list backward pointer |
+| **`0x38..0x3F`** | **8 B** | **`callback`** | **`PVOID`** | **EXECUTION TARGET POINTER (Payload Base)** |
+| `0x40..0x43` | 4 B | `numa_node` | `ULONG` (`u32`) | NUMA node preference (`0` = default) |
+| `0x44` | 1 B | `ideal_processor` | `UCHAR` (`u8`) | Core affinity (`0` = any) |
+| `0x45..0x47` | 3 B | `_padding` | `[u8; 3]` | Explicit alignment padding |
 
 #### Cross-Architecture Comparison (x86 vs x86_64)
 

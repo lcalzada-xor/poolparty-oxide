@@ -1,0 +1,19 @@
+[package]
+name = "poolparty-oxide"
+version = "1.0.0"
+edition = "2021"
+authors = ["Lucas Calzada <lcalzada-xor>"]
+description = "A Rust implementation of the PoolParty process injection technique targeting the Windows Thread Pool via NtSetIoCompletion and TP_DIRECT."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lcalzada-xor/poolparty-oxide"
+homepage = "https://github.com/lcalzada-xor/poolparty-oxide"
+readme = "README.md"
+keywords = ["windows-internals", "threadpool", "process-injection", "security-research", "rust"]
+categories = ["os::windows-apis", "development-tools::debugging"]
+
+[lib]
+name = "poolparty_oxide"
+path = "src/execute_poolparty_shellcode.rs"
+
+[dependencies]
+zada-xor = { git = "https://github.com/lcalzada-xor/zada-xor", branch = "main" }
